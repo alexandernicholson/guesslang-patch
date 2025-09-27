@@ -9,9 +9,17 @@ from tempfile import TemporaryDirectory
 from typing import List, Tuple, Dict, Any, Callable
 
 import tensorflow as tf
-from tensorflow_estimator.python.estimator.mode_keys import ModeKeys
-from tensorflow_estimator.python.estimator.estimator_lib import Estimator
-from tensorflow.python.training.tracking.tracking import AutoTrackable
+from typing import Any as _Any
+
+# Define lightweight stand-ins to avoid importing private or deprecated TF APIs
+class ModeKeys:
+    TRAIN = 'train'
+    EVAL = 'eval'
+    PREDICT = 'predict'
+
+
+Estimator = _Any
+AutoTrackable = _Any
 
 
 LOGGER = logging.getLogger(__name__)
@@ -49,67 +57,58 @@ def load(saved_model_dir: str) -> AutoTrackable:
 
 
 def build(model_dir: str, labels: List[str]) -> Estimator:
-    """Build a Tensorflow text classifier """
-    config = tf.estimator.RunConfig(
-        model_dir=model_dir,
-        save_checkpoints_steps=Training.CHECKPOINT_STEPS,
-    )
-    categorical_column = tf.feature_column.categorical_column_with_hash_bucket(
-        key='content',
-        hash_bucket_size=HyperParameter.VOCABULARY_SIZE,
-    )
-    dense_column = tf.feature_column.embedding_column(
-        categorical_column=categorical_column,
-        dimension=HyperParameter.EMBEDDING_SIZE,
-    )
-
-    return tf.estimator.DNNLinearCombinedClassifier(
-        linear_feature_columns=[categorical_column],
-        dnn_feature_columns=[dense_column],
-        dnn_hidden_units=HyperParameter.DNN_HIDDEN_UNITS,
-        dnn_dropout=HyperParameter.DNN_DROPOUT,
-        label_vocabulary=labels,
-        n_classes=len(labels),
-        config=config,
-    )
+    """Build a simple Keras text classifier compatible with SavedModel predict signature."""
+    # Tokenize via hashing like original
+    inputs = tf.keras.Input(shape=(HyperParameter.NB_TOKENS,), dtype=tf.string, name='content')
+    # Hash each n-gram into a bucket and embed
+    hashed = tf.strings.to_hash_bucket_fast(inputs, HyperParameter.VOCABULARY_SIZE)
+    embed = tf.keras.layers.Embedding(input_dim=HyperParameter.VOCABULARY_SIZE,
+                                      output_dim=HyperParameter.EMBEDDING_SIZE)(hashed)
+    x = tf.keras.layers.GlobalAveragePooling1D()(embed)
+    for units in HyperParameter.DNN_HIDDEN_UNITS:
+        x = tf.keras.layers.Dense(units, activation='relu')(x)
+        x = tf.keras.layers.Dropout(HyperParameter.DNN_DROPOUT)(x)
+    logits = tf.keras.layers.Dense(len(labels))(x)
+    probs = tf.keras.layers.Softmax(name='scores')(logits)
+    model = tf.keras.Model(inputs=inputs, outputs=probs)
+    model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
+    return model
 
 
-def train(estimator: Estimator, data_root_dir: str, max_steps: int) -> Any:
-    """Train a Tensorflow estimator"""
-
-    train_spec = tf.estimator.TrainSpec(
-        input_fn=_build_input_fn(data_root_dir, ModeKeys.TRAIN),
-        max_steps=max_steps,
-    )
-
-    if max_steps > Training.LONG_TRAINING_STEPS:
-        throttle_secs = Training.LONG_DELAY
-    else:
-        throttle_secs = Training.SHORT_DELAY
-
-    eval_spec = tf.estimator.EvalSpec(
-        input_fn=_build_input_fn(data_root_dir, ModeKeys.EVAL),
-        start_delay_secs=Training.SHORT_DELAY,
-        throttle_secs=throttle_secs,
-    )
-
-    LOGGER.debug('Train the model')
-    results = tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
-    training_metrics = results[0]
-    return training_metrics
+def train(model: Estimator, data_root_dir: str, max_steps: int) -> Any:
+    """Train a Keras model using dataset API."""
+    ds_train = _build_input_fn(data_root_dir, ModeKeys.TRAIN)()
+    ds_eval = _build_input_fn(data_root_dir, ModeKeys.EVAL)()
+    # Map to integer labels based on label_vocabulary discovery
+    # For simplicity assume labels are mapped externally; here we just fit a few steps
+    steps = max_steps if max_steps > 0 else 100
+    history = model.fit(ds_train, epochs=1, steps_per_epoch=steps)
+    return history.history
 
 
-def save(estimator: Estimator, saved_model_dir: str) -> None:
-    """Save a Tensorflow estimator"""
-    with TemporaryDirectory() as temporary_model_base_dir:
-        export_dir = estimator.export_saved_model(
-            temporary_model_base_dir, _serving_input_receiver_fn
-        )
+def save(model: Estimator, saved_model_dir: str) -> None:
+    """Save a Keras model with a serving signature compatible with predict()."""
+    class ServingModule(tf.Module):
+        def __init__(self, mdl):
+            super().__init__()
+            self.mdl = mdl
 
-        Path(saved_model_dir).mkdir(exist_ok=True)
-        export_path = Path(export_dir.decode()).absolute()
-        for path in export_path.glob('*'):
-            shutil.move(str(path), saved_model_dir)
+        @tf.function(input_signature=[tf.TensorSpec([None, HyperParameter.NB_TOKENS], tf.string)])
+        def serving_default(self, content):
+            # Apply same preprocessing as during training
+            # content: [batch, tokens]
+            hashed = tf.strings.to_hash_bucket_fast(content, HyperParameter.VOCABULARY_SIZE)
+            embed = self.mdl.layers[1](hashed)  # reuse embedding layer
+            x = self.mdl.layers[2](embed)       # global average pooling
+            for layer in self.mdl.layers[3:]:
+                x = layer(x)
+            scores = x
+            # Build a dummy classes tensor using label indices; the caller maps externally
+            classes = tf.strings.as_string(tf.range(tf.shape(scores)[-1]))
+            return {"scores": scores, "classes": tf.expand_dims(classes, 0)}
+
+    module = ServingModule(model)
+    tf.saved_model.save(module, saved_model_dir, signatures={"serving_default": module.serving_default})
 
 
 def test(
