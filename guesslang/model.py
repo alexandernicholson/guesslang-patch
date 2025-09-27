@@ -9,7 +9,8 @@ from tempfile import TemporaryDirectory
 from typing import List, Tuple, Dict, Any, Callable
 
 import tensorflow as tf
-from tensorflow.estimator import ModeKeys, Estimator
+from tensorflow_estimator.python.estimator.mode_keys import ModeKeys
+from tensorflow_estimator.python.estimator.estimator_lib import Estimator
 from tensorflow.python.training.tracking.tracking import AutoTrackable
 
 
