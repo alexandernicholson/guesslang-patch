@@ -178,18 +178,8 @@ def _build_input_fn(
     return input_function
 
 
-def _serving_input_receiver_fn() -> tf.estimator.export.ServingInputReceiver:
-    """Function to serve model for predictions."""
-
-    content = tf.compat.v1.placeholder(tf.string, [None])
-    receiver_tensors = {'content': content}
-    features = {'content': tf.map_fn(_preprocess_text, content)}
-
-    return tf.estimator.export.ServingInputReceiver(
-        receiver_tensors=receiver_tensors,
-        features=features,
-    )
-
+def _serving_input_receiver_fn():
+    return None
 
 def _read_file(filename: str) -> Tuple[tf.Tensor, tf.Tensor]:
     """Read a source file, return the content and the extension"""
